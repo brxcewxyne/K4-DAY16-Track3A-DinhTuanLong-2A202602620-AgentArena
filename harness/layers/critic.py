@@ -79,16 +79,98 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report
+        observed = getattr(ctx, "observed_text", "") or ""
+        corpus = getattr(ctx, "corpus", None)
+        docs = list(getattr(corpus, "docs", None) or []) if corpus is not None else []
+
+        def _line_match(body, text):
+            if not isinstance(body, str) or not isinstance(text, str) or not text:
+                return False
+            return any(text in line for line in body.splitlines())
+
+        def _find_observed_doc(part):
+            for doc in docs:
+                body = getattr(doc, "body", "")
+                if not isinstance(body, str) or not body:
+                    continue
+                if body not in observed:
+                    continue
+                if _line_match(body, part):
+                    return doc.doc_id
+            return None
+
+        kept = []
+        rescued_any = False
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            if text in observed:
+                kept.append(claim)
+                continue
+            rescued = self._rescue_fused(text, observed, _find_observed_doc)
+            if rescued is not None:
+                kept.extend(rescued)
+                rescued_any = True
+        report["claims"] = kept
+        seen = set()
+        ordered = []
+        for claim in kept:
+            doc_id = claim.get("doc_id")
+            if isinstance(doc_id, str) and doc_id and doc_id not in seen:
+                seen.add(doc_id)
+                ordered.append(doc_id)
+        report["citations"] = sorted(ordered)
+        if rescued_any:
+            report["abstain"] = True
+        if not kept:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = (
+                "Không đủ căn cứ để trả lời: không tìm thấy bằng chứng hỗ trợ "
+                "trong các tài liệu đã quan sát."
+            )
+        return report
+
+    #: Conjunctions used to detect a two-part fused claim. " và " is the
+    #: documented MockModel fusion joint; the rest are conservative,
+    #: repository-implied variants for real-model generality.
+    _FUSION_JOINS = (" và ", " nhưng ", " còn ", " trong khi ", "; ", ", còn ")
+
+    #: Minimum rescued-part length, aligned with the scorer's support floor:
+    #: shorter fragments match everywhere and prove nothing.
+    _MIN_PART_CHARS = 12
+
+    def _rescue_fused(self, text, observed, find_doc):
+        for join in self._FUSION_JOINS:
+            start = 0
+            while True:
+                pos = text.find(join, start)
+                if pos < 0:
+                    break
+                left = text[:pos].strip()
+                right = text[pos + len(join):].strip()
+                start = pos + 1
+                if not left or not right:
+                    continue
+                if len(left) < self._MIN_PART_CHARS or len(right) < self._MIN_PART_CHARS:
+                    continue
+                if left not in observed or right not in observed:
+                    continue
+                left_doc = find_doc(left)
+                right_doc = find_doc(right)
+                if left_doc is None or right_doc is None or left_doc == right_doc:
+                    continue
+                return [
+                    {"text": left, "doc_id": left_doc},
+                    {"text": right, "doc_id": right_doc},
+                ]
+        return None

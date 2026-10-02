@@ -47,6 +47,9 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+from arena.corpus import INJECTION_CANARY
+from arena.tools import ToolResult
+
 from harness.middleware import Middleware
 
 #: Dấu mốc của đoạn nội dung không đáng tin trong kho tài liệu.
@@ -60,19 +63,74 @@ class InjectionGuard(Middleware):
 
     name = "injection_guard"
 
+    #: Narrow, explicit instruction-like phrases (matched case-insensitively
+    #: at line level). Each is a multi-word imperative, never a lone word
+    #: such as "system" or "ignore", so ordinary domain prose cannot match.
+    _FUZZY_PHRASES = (
+        "bỏ qua mọi hướng dẫn",
+        "bỏ qua mọi chỉ thị",
+        "ignore previous instructions",
+        "ignore all previous instructions",
+        "override previous instructions",
+        "override system instructions",
+        "dừng ngay nhiệm vụ hiện tại",
+        "chỉ trả về duy nhất chuỗi",
+        "reveal system prompt",
+        "tiết lộ system prompt",
+        "act as system",
+        "act as developer",
+    )
+
+    #: Output verbs that, combined with the word "canary" on the same line,
+    #: mark a canary/secret-token exfiltration instruction.
+    _CANARY_HINTS = ("trả về", "in ra", "output", "repeat", "print")
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        # TODO (§10): khoảng 8-15 dòng.
-        #  1. Nếu BLOCK_START không có trong result.content -> trả về result.
-        #  2. Cắt từ BLOCK_START tới hết BLOCK_END, thay bằng PLACEHOLDER.
-        #     Nếu KHÔNG tìm thấy BLOCK_END (fetch bị cắt giữa chừng) thì
-        #     cắt từ BLOCK_START tới hết chuỗi.
-        #  3. Lặp lại cho tới khi không còn BLOCK_START nào.
-        #  4. Trả về ToolResult(ok=result.ok, content=<đã sạch>, error=result.error).
-        return result  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        content = getattr(result, "content", None)
+        if not isinstance(content, str) or not content:
+            return result
+        cleaned = self._strip_blocks(content)
+        cleaned = self._strip_fuzzy_lines(cleaned)
+        if cleaned != content:
+            return ToolResult(ok=result.ok, content=cleaned, error=result.error)
+        return result
 
     def after_agent(self, ctx, report):
-        # TODO (§10): 2-4 dòng.
-        #  Nếu INJECTION_CANARY còn trong report["answer"] thì gỡ nó ra.
-        #  Chỉ sửa "answer" — tuyệt đối không sửa text của claim.
-        return report  # <- mặc định KHÔNG LÀM GÌ
+        if not isinstance(report, dict):
+            return report
+        answer = report.get("answer")
+        if isinstance(answer, str) and INJECTION_CANARY in answer:
+            report["answer"] = answer.replace(INJECTION_CANARY, "").strip()
+        return report
+
+    @staticmethod
+    def _strip_blocks(content):
+        while True:
+            start = content.find(BLOCK_START)
+            if start < 0:
+                return content
+            end = content.find(BLOCK_END, start + len(BLOCK_START))
+            if end < 0:
+                return content[:start] + PLACEHOLDER
+            content = content[:start] + PLACEHOLDER + content[end + len(BLOCK_END):]
+
+    @classmethod
+    def _strip_fuzzy_lines(cls, content):
+        lines = content.split("\n")
+        changed = False
+        for index, line in enumerate(lines):
+            if cls._is_suspicious_line(line):
+                lines[index] = PLACEHOLDER
+                changed = True
+        return "\n".join(lines) if changed else content
+
+    @classmethod
+    def _is_suspicious_line(cls, line):
+        lowered = line.casefold()
+        for phrase in cls._FUZZY_PHRASES:
+            if phrase in lowered:
+                return True
+        if "canary" in lowered and any(hint in lowered for hint in cls._CANARY_HINTS):
+            return True
+        return False
