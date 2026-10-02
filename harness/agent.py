@@ -650,9 +650,15 @@ class ReActAgent:
             # Not a THOUGHT/ACTION turn and not a FINAL either. Say so
             # rather than guessing — a real model that drifts off the
             # protocol needs to be told, and the mock never gets here.
+            # Mock-neutral by construction: MockModel always emits a valid
+            # ACTION or FINAL, so this branch never fires on the mock path
+            # and the practice ladder stays byte-identical.
             return (
                 f"{TOOL_ERROR_PREFIX} không đọc được ACTION. Hãy trả lời đúng định dạng "
-                "THOUGHT/ACTION hoặc THOUGHT/FINAL."
+                "THOUGHT/ACTION hoặc THOUGHT/FINAL. "
+                "Mỗi lượt chỉ gọi đúng một công cụ: search trước, fetch_doc để đọc "
+                "toàn văn, rồi trích NGUYÊN VĂN một dòng đã đọc vào claims kèm đúng "
+                "doc_id của nó; không suy đoán khi chưa đọc."
             )
 
         call = self.middleware.wrap_tool_call(ctx, self._dispatch)
@@ -670,7 +676,14 @@ class ReActAgent:
             return self.tools.fetch_doc(_as_text(args.get("doc_id")))
         if name == "calc":
             return self.tools.calc(_as_text(args.get("expression")) or "0")
-        return ToolResult(ok=False, content="", error=f"unknown tool: {name!r}")
+        # Mock-neutral: MockModel only ever names the three real tools, so
+        # this branch never fires on the mock path. A real model that invents
+        # a tool name gets the valid set named back instead of a bare error.
+        return ToolResult(
+            ok=False,
+            content="",
+            error=f"unknown tool: {name!r}. Chỉ dùng search, fetch_doc, calc.",
+        )
 
 
 def _as_text(value) -> str:
